@@ -24,6 +24,10 @@ $Base     = Join-Path $env:USERPROFILE 'MiroFish-Launcher'
 $LogDir   = Join-Path $Base 'logs'
 $Launcher = Join-Path $Base 'MiroFish-Baslat.ps1'
 $Marker   = Join-Path $Base 'kurulum-tamam.txt'
+$envFile  = Join-Path $Root '.env'
+# MIROFISH_LAUNCHER_ONLY=1 ise yalnızca başlatıcı/kısayollar güncellenir (bağımlılık, depo ve .env'e dokunulmaz).
+$LauncherOnly = ($env:MIROFISH_LAUNCHER_ONLY -eq '1')
+Remove-Item Env:\MIROFISH_LAUNCHER_ONLY -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $InstallLog = Join-Path $LogDir ("kurulum-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $ErrorLog   = Join-Path $LogDir 'hatalar.log'
@@ -70,6 +74,12 @@ function Ensure-Tool([string]$Cmd, [string]$WingetId, [string]$Label) {
 
 $failed = $false
 try {
+  if ($LauncherOnly) {
+    if (-not (Test-Path (Join-Path $Root 'backend\.venv'))) {
+      throw "Mevcut bir MiroFish kurulumu bulunamadı ($Root). Tam kurulum komutunu çalıştırın."
+    }
+    Write-Host 'Yalnızca başlatıcı güncelleniyor; depo, bağımlılıklar ve .env korunuyor.' -ForegroundColor Yellow
+  } else {
   Step 'Gereksinimler'
   Update-SessionPath
   Ensure-Tool 'git'  'Git.Git'            'Git'
@@ -117,54 +127,93 @@ try {
   }
 
   Step '.env yapılandırması'
-  $envFile = Join-Path $Root '.env'
   if (-not (Test-Path $envFile)) {
     Copy-Item (Join-Path $Root '.env.example') $envFile
     Write-Host "[OK] $envFile oluşturuldu." -ForegroundColor Green
   } else { Write-Host '[OK] .env zaten var, dokunulmadı.' -ForegroundColor Green }
+  }  # tam kurulum sonu
 
   Step 'Başlatıcı ve kısayollar'
   $launcherText = @'
-# MiroFish başlatıcı - kurulum betiği tarafından üretilir. Elle düzenlemeyin.
+# MiroFish başlatıcı (v2) - kurulum betiği tarafından üretilir. Elle düzenlemeyin.
+# Varsayılan portlar: frontend 3001, backend 5001. Doluysa boş port bulunur.
+# Yalnızca MiroFish klasöründen başlayan süreçleri durdurur; başka uygulamalara (ör. 3000 portundaki servis) dokunmaz.
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 $env:PYTHONUTF8 = '1'
-$Root   = Join-Path $env:USERPROFILE 'MiroFish'
-$Base   = Join-Path $env:USERPROFILE 'MiroFish-Launcher'
-$LogDir = Join-Path $Base 'logs'
+$Root      = Join-Path $env:USERPROFILE 'MiroFish'
+$Base      = Join-Path $env:USERPROFILE 'MiroFish-Launcher'
+$LogDir    = Join-Path $Base 'logs'
+$StateFile = Join-Path $Base 'calisan.json'
+$PreferredFrontend = 3001
+$PreferredBackend  = 5001
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$Stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
+$Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 Get-ChildItem $LogDir -File -ErrorAction SilentlyContinue |
   Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } | Remove-Item -Force -ErrorAction SilentlyContinue
 try { Start-Transcript -Path (Join-Path $LogDir "baslat-$Stamp.log") | Out-Null } catch {}
 
-function Test-Port([int]$Port) {
+# Port bir uygulama tarafından dinleniyor mu? (tüm adresler: 127.0.0.1, ::1, 0.0.0.0)
+function Test-Listening([int]$Port) {
+  try { return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop) }
+  catch { return $false }
+}
+
+function Test-PortFree([int]$Port) {
+  if (Test-Listening $Port) { return $false }
   try {
-    $c = New-Object Net.Sockets.TcpClient
-    $iar = $c.BeginConnect('127.0.0.1', $Port, $null, $null)
-    $ok = $iar.AsyncWaitHandle.WaitOne(500) -and $c.Connected
-    $c.Close(); return $ok
+    $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Any, $Port)
+    $l.Start(); $l.Stop(); return $true
   } catch { return $false }
 }
 
-# Portu dinleyen süreç(ler) MiroFish'e mi ait? (Başka projeleri yanlışlıkla kapatmamak için.)
-function Get-PortOwners([int]$Port) {
-  $pids = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
-  foreach ($p in $pids) {
-    $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
-    [pscustomobject]@{ Pid = $p; Mine = [bool]($cim -and (($cim.CommandLine -like "*$Root*") -or ($cim.ExecutablePath -like "$Root*"))) }
+function Find-FreePort([int]$Start, [int[]]$Skip = @()) {
+  for ($p = $Start; $p -lt ($Start + 100); $p++) {
+    if ($Skip -contains $p) { continue }
+    if (Test-PortFree $p) { return $p }
+  }
+  throw "$Start ile $($Start + 99) arasında boş port bulunamadı."
+}
+
+# Sunucu bağlantı kabul ediyor mu?
+function Test-Connect([int]$Port) {
+  foreach ($addr in '127.0.0.1', '::1') {
+    try {
+      $c = New-Object Net.Sockets.TcpClient
+      $iar = $c.BeginConnect($addr, $Port, $null, $null)
+      $ok = $iar.AsyncWaitHandle.WaitOne(400) -and $c.Connected
+      $c.Close()
+      if ($ok) { return $true }
+    } catch {}
+  }
+  return $false
+}
+
+# Bu süreç MiroFish klasöründen mi başlatılmış? (yol "…\MiroFish\" içeriyor mu)
+function Test-Mine([int]$ProcId) {
+  $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcId" -ErrorAction SilentlyContinue
+  if (-not $cim) { return $false }
+  $needle = $Root.TrimEnd('\') + '\'
+  foreach ($s in @($cim.CommandLine, $cim.ExecutablePath)) {
+    if ($s -and ($s.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0)) { return $true }
+  }
+  return $false
+}
+
+function Get-MineOnPort([int]$Port) {
+  $pids = @()
+  try { $pids = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique) } catch {}
+  @($pids | Where-Object { Test-Mine $_ })
+}
+
+# Yalnızca verilen portlardaki MiroFish süreçlerini durdurur.
+function Stop-Mine([int[]]$Ports) {
+  foreach ($port in $Ports) {
+    foreach ($procId in @(Get-MineOnPort $port)) { & taskkill.exe /PID $procId /T /F 2>&1 | Out-Null }
   }
 }
 
-function Stop-MiroFish {
-  foreach ($port in 3000, 5001) {
-    foreach ($o in @(Get-PortOwners $port)) {
-      if ($o.Mine) { & taskkill.exe /PID $o.Pid /T /F 2>&1 | Out-Null }
-    }
-  }
-}
-
-$own = @()
+$own = @(); $fport = 0; $bport = 0
 try {
   if (-not (Test-Path (Join-Path $Root 'backend\.venv'))) {
     throw "Kurulum bulunamadı. Önce kurulum komutunu çalıştırın (bkz. MiroFish-Launcher\README.txt)."
@@ -174,36 +223,49 @@ try {
     Write-Warning "LLM_API_KEY / ZEP_API_KEY henüz girilmemiş. Arayüz açılır ama simülasyon çalışmaz. 'MiroFish Ayarlar (.env)' kısayoluyla düzenleyin."
   }
 
-  # Port çakışması: MiroFish zaten çalışıyorsa sadece tarayıcıyı aç; başka uygulamaysa dur.
-  $busy = @(); foreach ($port in 3000, 5001) { foreach ($o in @(Get-PortOwners $port)) { $busy += $o } }
-  if ($busy.Count -gt 0) {
-    if (@($busy | Where-Object { -not $_.Mine }).Count -gt 0) {
-      throw "3000 veya 5001 portu başka bir uygulama tarafından kullanılıyor. O uygulamayı kapatıp tekrar deneyin."
+  # MiroFish zaten çalışıyorsa (önceki başlatmadan) yalnızca tarayıcıyı aç.
+  $st = $null
+  if (Test-Path $StateFile) { try { $st = Get-Content $StateFile -Raw | ConvertFrom-Json } catch {} }
+  if ($st) {
+    if ((@(Get-MineOnPort ([int]$st.frontendPort)).Count -gt 0) -and (@(Get-MineOnPort ([int]$st.backendPort)).Count -gt 0)) {
+      $url = "http://localhost:$($st.frontendPort)"
+      Write-Host "MiroFish zaten çalışıyor; tarayıcı açılıyor: $url" -ForegroundColor Green
+      Start-Process $url
+      $ans = Read-Host 'Durdurmak için "d" yazıp Enter, çıkmak için sadece Enter'
+      if ($ans -eq 'd') { Stop-Mine @([int]$st.frontendPort, [int]$st.backendPort); Remove-Item $StateFile -Force -ErrorAction SilentlyContinue; Write-Host 'Durduruldu.' }
+      return
     }
-    Write-Host 'MiroFish zaten çalışıyor; tarayıcı açılıyor.' -ForegroundColor Green
-    Start-Process 'http://localhost:3000'
-    $ans = Read-Host 'Durdurmak için "d" yazıp Enter, çıkmak için sadece Enter'
-    if ($ans -eq 'd') { Stop-MiroFish; Write-Host 'Durduruldu.' }
-    return
+    Remove-Item $StateFile -Force -ErrorAction SilentlyContinue
   }
 
-  Write-Host 'MiroFish başlatılıyor...' -ForegroundColor Cyan
+  # Boş port seç. Dolu portlardaki uygulamalara dokunulmaz, sadece atlanır.
+  $bport = Find-FreePort $PreferredBackend
+  $fport = Find-FreePort $PreferredFrontend @($bport)
+  if ($bport -ne $PreferredBackend)  { Write-Warning "Backend için $PreferredBackend dolu; $bport kullanılacak." }
+  if ($fport -ne $PreferredFrontend) { Write-Warning "Frontend için $PreferredFrontend dolu; $fport kullanılacak." }
+
+  # Backend portu FLASK_PORT ile, frontend'in API adresi VITE_API_BASE_URL ile ayarlanır (kaynak koda dokunulmaz).
+  $env:FLASK_PORT         = "$bport"
+  $env:VITE_API_BASE_URL  = "http://localhost:$bport"
+
+  Write-Host "MiroFish başlatılıyor... (frontend: $fport, backend: $bport)" -ForegroundColor Cyan
   $b = Start-Process cmd.exe -ArgumentList '/c', 'npm run backend' -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $LogDir "backend-$Stamp.out.log") -RedirectStandardError (Join-Path $LogDir "backend-$Stamp.err.log")
-  $f = Start-Process cmd.exe -ArgumentList '/c', 'npx --no-install vite --host --no-open' -WorkingDirectory (Join-Path $Root 'frontend') -WindowStyle Hidden -PassThru `
+  $f = Start-Process cmd.exe -ArgumentList '/c', "npx --no-install vite --host --no-open --port $fport --strictPort" -WorkingDirectory (Join-Path $Root 'frontend') -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $LogDir "frontend-$Stamp.out.log") -RedirectStandardError (Join-Path $LogDir "frontend-$Stamp.err.log")
   $own = @($b, $f)
+  @{ frontendPort = $fport; backendPort = $bport; started = (Get-Date -Format 's') } | ConvertTo-Json | Set-Content -Path $StateFile -Encoding UTF8
 
   $deadline = (Get-Date).AddSeconds(120)
-  while (-not ((Test-Port 5001) -and (Test-Port 3000))) {
+  while (-not ((Test-Connect $bport) -and (Test-Connect $fport))) {
     if ($b.HasExited) { throw "Backend kapandı. Ayrıntı: $LogDir\backend-$Stamp.err.log" }
     if ($f.HasExited) { throw "Frontend kapandı. Ayrıntı: $LogDir\frontend-$Stamp.err.log" }
     if ((Get-Date) -gt $deadline) { throw "120 sn içinde açılmadı. Kayıtlar: $LogDir" }
     Start-Sleep -Milliseconds 700
   }
-  Start-Process 'http://localhost:3000'
+  Start-Process "http://localhost:$fport"
   Write-Host ''
-  Write-Host 'MiroFish çalışıyor:  http://localhost:3000   (API: http://localhost:5001)' -ForegroundColor Green
+  Write-Host "MiroFish çalışıyor:  http://localhost:$fport   (API: http://localhost:$bport)" -ForegroundColor Green
   Write-Host "Kayıtlar: $LogDir"
   Write-Host 'Kapatmak için bu pencerede Enter tuşuna basın (pencereyi X ile kapatırsanız servisler arkada kalır; kısayola yeniden tıklayıp "d" yazarak durdurabilirsiniz).'
   [void](Read-Host)
@@ -217,7 +279,10 @@ catch {
 }
 finally {
   foreach ($p in $own) { if ($p -and -not $p.HasExited) { & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null } }
-  if ($own.Count -gt 0) { Stop-MiroFish }
+  if ($own.Count -gt 0) {
+    Stop-Mine @($fport, $bport)
+    Remove-Item $StateFile -Force -ErrorAction SilentlyContinue
+  }
   try { Stop-Transcript | Out-Null } catch {}
 }
 '@
@@ -235,7 +300,7 @@ finally {
   $lnk.Arguments        = "-NoProfile -ExecutionPolicy Bypass -File `"$Launcher`""
   $lnk.WorkingDirectory = $Root
   $lnk.IconLocation     = "$psExe,0"
-  $lnk.Description      = 'MiroFish servislerini başlatır ve http://localhost:3000 adresini açar'
+  $lnk.Description      = 'MiroFish servislerini başlatır ve arayüzü tarayıcıda açar (varsayılan http://localhost:3001)'
   $lnk.Save()
 
   $lnk2 = $ws.CreateShortcut((Join-Path $desktop 'MiroFish Ayarlar (.env).lnk'))
@@ -245,11 +310,11 @@ finally {
   Write-Host "[OK] Masaüstüne kısayollar eklendi." -ForegroundColor Green
 
   Step 'Tamamlandı'
-  Write-Host 'Kurulum bitti. Sıradaki adımlar:' -ForegroundColor Green
+  Write-Host ($(if ($LauncherOnly) { 'Başlatıcı güncellendi.' } else { 'Kurulum bitti.' }) + ' Sıradaki adımlar:') -ForegroundColor Green
   Write-Host "  1) .env dosyasına LLM_API_KEY ve ZEP_API_KEY girin (Masaüstü: 'MiroFish Ayarlar (.env)')."
   Write-Host "  2) Masaüstündeki 'MiroFish Başlat' kısayoluna çift tıklayın."
   Write-Host "Kayıtlar: $LogDir"
-  if ((Get-Content $envFile -Raw) -match 'your_api_key_here|your_zep_api_key_here') { Start-Process notepad.exe -ArgumentList "`"$envFile`"" }
+  if ((-not $LauncherOnly) -and ((Get-Content $envFile -Raw) -match 'your_api_key_here|your_zep_api_key_here')) { Start-Process notepad.exe -ArgumentList "`"$envFile`"" }
 }
 catch {
   $failed = $true
