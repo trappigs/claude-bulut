@@ -1,0 +1,331 @@
+diff --git a/backend/app/api/graph.py b/backend/app/api/graph.py
+index bcd21eb..901c057 100644
+--- a/backend/app/api/graph.py
++++ b/backend/app/api/graph.py
+@@ -26,6 +26,7 @@ from ..services.simulation_manager import SimulationManager
+ from ..services.simulation_runner import SimulationRunner, RunnerStatus
+ from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
+ from ..utils.llm_client import LLMResponseError
++from ..utils.openai_chat_compat import describe_provider_error
+ 
+ # 获取日志器
+ logger = get_logger('mirofish.api')
+@@ -411,10 +412,13 @@ def generate_ontology():
+             # Provider exception bodies may echo request content. Keep the
+             # server log useful without serializing the exception body.
+             logger.error(
+-                "Ontology provider request failed: type=%s status=%s request_id=%s",
++                "Ontology provider request failed: type=%s status=%s request_id=%s "
++                "model=%s detail=[%s]",
+                 type(error).__name__,
+                 provider_status,
+                 request_id or "unknown",
++                Config.LLM_MODEL_NAME,
++                describe_provider_error(error),
+             )
+         else:
+             public_error = "Ontology generation failed; check the server logs"
+diff --git a/backend/app/utils/openai_chat_compat.py b/backend/app/utils/openai_chat_compat.py
+index f0ce937..6478ed4 100644
+--- a/backend/app/utils/openai_chat_compat.py
++++ b/backend/app/utils/openai_chat_compat.py
+@@ -7,7 +7,97 @@ gracefully adapting request parameters for GPT-5 family models.
+ 
+ from __future__ import annotations
+ 
+-from typing import Any, Dict, List, Optional
++import logging
++import re
++from typing import Any, Dict, List, Optional, Set
++
++logger = logging.getLogger(__name__)
++
++_UNSUPPORTED_CODES = {
++    "unsupported_parameter",
++    "unsupported_value",
++    "unknown_parameter",
++    "invalid_parameter",
++}
++
++# Parameters this layer can adapt after an explicit provider rejection.
++_ADAPTABLE_PARAMS = ("temperature", "max_tokens")
++
++# Per-model adaptations learned from explicit provider rejections, so a model
++# that refuses e.g. a custom temperature costs one rejected request, not one
++# per call. Keys are lower-cased model names.
++_LEARNED: Dict[str, Set[str]] = {}
++
++# Error codes / request parameters whose provider message is a short,
++# parameter-level description that does not echo user content.
++_MESSAGE_SAFE_CODES = _UNSUPPORTED_CODES | {
++    "context_length_exceeded",
++    "model_not_found",
++    "invalid_model",
++    "rate_limit_exceeded",
++    "insufficient_quota",
++}
++_MESSAGE_SAFE_PARAMS = {
++    "temperature", "top_p", "max_tokens", "max_completion_tokens",
++    "response_format", "reasoning_effort", "reasoning", "model",
++    "presence_penalty", "frequency_penalty", "n", "stop", "seed",
++}
++
++
++def _error_details(error: Exception) -> Dict[str, str]:
++    """Return the provider's structured error fields (never the request)."""
++    body = getattr(error, "body", None)
++    details = body.get("error", body) if isinstance(body, dict) else {}
++    if not isinstance(details, dict):
++        details = {}
++    return {
++        "code": str(details.get("code") or "").strip().lower(),
++        "param": str(details.get("param") or "").strip().lower(),
++        "type": str(details.get("type") or "").strip().lower(),
++        "message": str(details.get("message") or ""),
++    }
++
++
++def _rejected_param(error: Exception) -> Optional[str]:
++    """Name the adaptable parameter a provider explicitly rejected, if any."""
++    if getattr(error, "status_code", None) not in {400, 422}:
++        return None
++    details = _error_details(error)
++    param = details["param"]
++    if param in _ADAPTABLE_PARAMS and (
++        details["code"] in _UNSUPPORTED_CODES or not details["code"]
++        or details["type"] == "invalid_request_error"
++    ):
++        return param
++    return None
++
++
++def describe_provider_error(error: Exception) -> str:
++    """
++    Short, log-safe description of a provider error.
++
++    Always includes the structured ``code``/``param``/``type`` fields. The
++    provider message is included only for parameter-level or limit errors, and
++    is redacted and truncated. Request messages and documents are never logged.
++    """
++    details = _error_details(error)
++    parts = [
++        f"code={_scrub(details['code']) or 'unknown'}",
++        f"param={_scrub(details['param']) or 'none'}",
++        f"type={_scrub(details['type']) or 'unknown'}",
++    ]
++    if details["message"] and (
++        details["code"] in _MESSAGE_SAFE_CODES
++        or details["param"] in _MESSAGE_SAFE_PARAMS
++    ):
++        parts.append(f"message={_scrub(details['message'], 240)}")
++    return " ".join(parts)
++
++
++def _scrub(text: str, limit: int = 80) -> str:
++    cleaned = re.sub(r"\s+", " ", str(text)).strip()
++    cleaned = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+", "[redacted]", cleaned)
++    return cleaned[:limit]
+ 
+ 
+ def is_gpt5_family(model: Optional[str]) -> bool:
+@@ -54,9 +144,38 @@ def create_chat_completion(
+         else:
+             kwargs["max_tokens"] = max_tokens
+ 
++    model_key = (model or "").strip().lower()
++    for learned in _LEARNED.get(model_key, ()):
++        _apply_adaptation(kwargs, learned)
++
++    # Providers occasionally reject a parameter a model does not support (for
++    # example a custom temperature on reasoning-style models). Retry only after
++    # an explicit, structured rejection of that parameter, once per parameter.
++    for _ in range(len(_ADAPTABLE_PARAMS) + 1):
++        try:
++            return client.chat.completions.create(**kwargs)
++        except Exception as error:
++            rejected = _rejected_param(error)
++            if rejected is None or rejected in _LEARNED.get(model_key, ()):
++                raise
++            if rejected not in kwargs:
++                raise
++            logger.warning(
++                "Provider rejected %s for model %s; retrying once with an adapted request",
++                rejected, model,
++            )
++            _LEARNED.setdefault(model_key, set()).add(rejected)
++            _apply_adaptation(kwargs, rejected)
+     return client.chat.completions.create(**kwargs)
+ 
+ 
++def _apply_adaptation(kwargs: Dict[str, Any], param: str) -> None:
++    if param == "temperature":
++        kwargs.pop("temperature", None)
++    elif param == "max_tokens" and "max_tokens" in kwargs:
++        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
++
++
+ def extract_chat_completion_text(response: Any) -> str:
+     """Extract plain text from chat completion response across SDK content shapes."""
+     choices = getattr(response, "choices", None) or []
+diff --git a/backend/tests/test_ontology_api_errors.py b/backend/tests/test_ontology_api_errors.py
+index cbfb320..adb087a 100644
+--- a/backend/tests/test_ontology_api_errors.py
++++ b/backend/tests/test_ontology_api_errors.py
+@@ -68,3 +68,41 @@ def test_ontology_api_does_not_expose_provider_error_body(tmp_path, monkeypatch)
+     assert "request-safe-id" in response.json["error"]
+     assert "SECRET-PROVIDER-BODY" not in response.get_data(as_text=True)
+     assert "traceback" not in response.json
++
++
++def test_ontology_api_logs_structured_provider_detail_not_content(tmp_path, monkeypatch):
++    import logging
++
++    records = []
++
++    class ListHandler(logging.Handler):
++        def emit(self, record):
++            records.append(record.getMessage())
++
++    handler = ListHandler(level=logging.ERROR)
++    graph_api.logger.addHandler(handler)
++    monkeypatch.setattr(graph_api.logger, "disabled", False)
++
++    class ProviderError(RuntimeError):
++        status_code = 400
++        request_id = "req_safe"
++        body = {"error": {"message": "Unsupported value: 'temperature' does not support 0.3 with this model.",
++                          "type": "invalid_request_error", "param": "temperature",
++                          "code": "unsupported_value"}}
++
++    class FailingGenerator:
++        def generate(self, **kwargs):
++            raise ProviderError("provider failed")
++
++    monkeypatch.setattr(ProjectManager, "PROJECTS_DIR", str(tmp_path))
++    monkeypatch.setattr(graph_api, "OntologyGenerator", FailingGenerator)
++    app = create_app()
++    app.config.update(TESTING=True)
++    response = _post_ontology(app.test_client())
++
++    assert response.status_code == 502
++    assert "does not support 0.3" not in response.get_data(as_text=True)
++    graph_api.logger.removeHandler(handler)
++    logged = " ".join(records)
++    assert "param=temperature" in logged and "code=unsupported_value" in logged
++    assert "A short source document" not in logged
+diff --git a/backend/tests/test_openai_chat_compat_adaptive.py b/backend/tests/test_openai_chat_compat_adaptive.py
+new file mode 100644
+index 0000000..2a7ff5e
+--- /dev/null
++++ b/backend/tests/test_openai_chat_compat_adaptive.py
+@@ -0,0 +1,110 @@
++import logging
++from types import SimpleNamespace
++
++import httpx
++import openai
++import pytest
++
++from app.utils import openai_chat_compat as compat
++from app.utils.openai_chat_compat import create_chat_completion, describe_provider_error
++
++
++def _bad_request(param, code="unsupported_value", message="rejected"):
++    request = httpx.Request("POST", "https://api.example.test/v1/chat/completions")
++    response = httpx.Response(400, request=request)
++    return openai.BadRequestError(
++        message,
++        response=response,
++        body={"error": {"message": message, "type": "invalid_request_error",
++                        "param": param, "code": code}},
++    )
++
++
++class Scripted:
++    def __init__(self, *outcomes):
++        self.outcomes = list(outcomes)
++        self.calls = []
++
++    def create(self, **kwargs):
++        self.calls.append(dict(kwargs))
++        outcome = self.outcomes.pop(0)
++        if isinstance(outcome, Exception):
++            raise outcome
++        return outcome
++
++
++def _client(scripted):
++    return SimpleNamespace(chat=SimpleNamespace(completions=scripted))
++
++
++@pytest.fixture(autouse=True)
++def _reset_learned():
++    compat._LEARNED.clear()
++    yield
++    compat._LEARNED.clear()
++
++
++def test_temperature_rejection_retries_once_without_temperature_and_is_remembered():
++    scripted = Scripted(_bad_request("temperature"), "ok1", "ok2")
++    client = _client(scripted)
++    kwargs = dict(model="future-model-x", messages=[{"role": "user", "content": "hi"}],
++                  temperature=0.3, max_tokens=None, response_format={"type": "json_object"})
++
++    assert create_chat_completion(client, **kwargs) == "ok1"
++    assert "temperature" in scripted.calls[0] and "temperature" not in scripted.calls[1]
++    assert scripted.calls[1]["response_format"] == {"type": "json_object"}
++
++    # Learned: the next call must not re-send temperature (no extra rejected request).
++    assert create_chat_completion(client, **kwargs) == "ok2"
++    assert len(scripted.calls) == 3 and "temperature" not in scripted.calls[2]
++
++
++def test_max_tokens_rejection_switches_to_max_completion_tokens():
++    scripted = Scripted(_bad_request("max_tokens", code="unsupported_parameter"), "ok")
++    create_chat_completion(_client(scripted), model="future-model-y",
++                           messages=[], temperature=None, max_tokens=321)
++    assert scripted.calls[0]["max_tokens"] == 321
++    assert scripted.calls[1] == {"model": "future-model-y", "messages": [],
++                                 "max_completion_tokens": 321}
++
++
++def test_both_rejections_adapt_in_sequence():
++    scripted = Scripted(_bad_request("max_tokens"), _bad_request("temperature"), "ok")
++    assert create_chat_completion(_client(scripted), model="m", messages=[],
++                                  temperature=0.5, max_tokens=10) == "ok"
++    assert scripted.calls[2] == {"model": "m", "messages": [], "max_completion_tokens": 10}
++
++
++def test_unrelated_400_is_propagated_without_retry():
++    error = _bad_request("messages", code="context_length_exceeded")
++    scripted = Scripted(error)
++    with pytest.raises(openai.BadRequestError):
++        create_chat_completion(_client(scripted), model="m", messages=[], temperature=0.3)
++    assert len(scripted.calls) == 1
++
++
++def test_response_format_rejection_is_not_handled_here():
++    scripted = Scripted(_bad_request("response_format"))
++    with pytest.raises(openai.BadRequestError):
++        create_chat_completion(_client(scripted), model="m", messages=[],
++                               response_format={"type": "json_object"})
++    assert len(scripted.calls) == 1
++
++
++def test_describe_provider_error_logs_parameter_message_but_not_unknown_messages():
++    safe = _bad_request("temperature", message="Unsupported value: 'temperature' does not support 0.3.")
++    assert "param=temperature" in describe_provider_error(safe)
++    assert "does not support 0.3" in describe_provider_error(safe)
++
++    unsafe = _bad_request("messages[0].content", code="invalid_value",
++                          message="SECRET-DOCUMENT-TEXT sk-abcdefghijklmnop")
++    detail = describe_provider_error(unsafe)
++    assert "SECRET-DOCUMENT-TEXT" not in detail and "sk-abcdefgh" not in detail
++    assert "code=invalid_value" in detail
++
++
++def test_describe_provider_error_redacts_api_keys_in_safe_messages():
++    error = _bad_request("model", code="model_not_found",
++                         message="Model missing for key sk-abcdefghijklmnopqrstuv")
++    detail = describe_provider_error(error)
++    assert "sk-abcdefgh" not in detail and "[redacted]" in detail
